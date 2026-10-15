@@ -1,0 +1,4 @@
+vmName,nicLabel,targetPortGroup,targetBackingType,datacenterName,dryRun
+web01,Network adapter 1,DMZ-VLAN200,DISTRIBUTED_PORTGROUP,,true
+web01,Network adapter 2,VM Network,STANDARD_PORTGROUP,,false
+db01,Network adapter 1,Shared,DISTRIBUTED_PORTGROUP,DC-East,false

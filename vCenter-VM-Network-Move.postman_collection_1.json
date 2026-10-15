@@ -1,0 +1,1004 @@
+{
+  "info": {
+    "_postman_id": "a72057c2-9dca-4713-9cb9-a96763db37eb",
+    "name": "vCenter - Move VM NIC between Port Groups / VDS",
+    "description": "# vCenter - Move VM NIC between Port Groups / VDS\n\nMoves a VM network adapter between **standard port groups (vSS)** and/or **distributed port groups (VDS)** using the\nvSphere Automation REST API (`/api`, vCenter 7.0 U2+ and 8.x).\n\n**Run order:** use the Collection Runner on the **Move VM Network** folder. Authentication is automatic (collection pre-request),\nevery step validates its result, and the flow aborts cleanly to Logout on any error.\n\n* Single VM: fill the environment and run the folder.\n* Bulk: run the folder with a CSV data file (`vmName,nicLabel,targetPortGroup,targetBackingType,datacenterName`).\n* Preview: set `dryRun=true`.\n* Undo: run the **Rollback** folder right after a single-VM move.\n\nMoving to another VDS = choose a port group on that VDS. The VM's host must be attached to the target VDS.\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "vmware-api-session-id",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "{{sessionId}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "/**",
+          " * Collection-level pre-request: transparent vCenter authentication.",
+          " * Reuses the current session while it is fresh, otherwise creates a new one",
+          " * via POST /api/session (HTTP Basic). Every request then sends the token in the",
+          " * 'vmware-api-session-id' header (collection auth = API key).",
+          " */",
+          "const IDLE_LIMIT_MS = 20 * 60 * 1000;            // vCenter default idle timeout is 30 min",
+          "const baseUrl   = pm.variables.get('baseUrl');",
+          "const sessionId = pm.environment.get('sessionId');",
+          "const lastUsed  = Number(pm.environment.get('sessionLastUsed') || 0);",
+          "",
+          "if (sessionId && (Date.now() - lastUsed) < IDLE_LIMIT_MS) {",
+          "    pm.environment.set('sessionLastUsed', String(Date.now()));",
+          "} else {",
+          "    const user = pm.variables.get('username');",
+          "    const pass = pm.variables.get('password');",
+          "    if (!baseUrl || !user || !pass) {",
+          "        throw new Error('Set baseUrl, username and password in the active environment.');",
+          "    }",
+          "    const CryptoJS = require('crypto-js');",
+          "    const basic = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Utf8.parse(user + ':' + pass));",
+          "",
+          "    pm.sendRequest({",
+          "        url: baseUrl + '/api/session',",
+          "        method: 'POST',",
+          "        header: [{ key: 'Authorization', value: 'Basic ' + basic }]",
+          "    }, (err, res) => {",
+          "        if (err) { console.error('vCenter unreachable: ' + err); return; }",
+          "        if (res.code !== 201 && res.code !== 200) {",
+          "            pm.environment.unset('sessionId');",
+          "            console.error('vCenter authentication failed: HTTP ' + res.code + ' ' + res.text());",
+          "            return;",
+          "        }",
+          "        pm.environment.set('sessionId', res.json());",
+          "        pm.environment.set('sessionLastUsed', String(Date.now()));",
+          "        console.log('vCenter session created for ' + user);",
+          "    });",
+          "}"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Collection-level test: uniform vCenter error reporting + stale-session cleanup.",
+          "const code = pm.response.code;",
+          "if (code === 401) {",
+          "    pm.environment.unset('sessionId');",
+          "    console.warn('Session rejected (401); a new session will be created on the next request.');",
+          "}",
+          "if (code >= 400) {",
+          "    let msg = pm.response.text();",
+          "    try {",
+          "        const b = pm.response.json();",
+          "        msg = (b.error_type || 'ERROR') + ': ' + (b.messages || []).map(m => m.default_message).join(' | ');",
+          "    } catch (e) { /* non-JSON body */ }",
+          "    console.error('[' + pm.info.requestName + '] HTTP ' + code + ' - ' + msg);",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Move VM Network",
+      "description": "Run this folder in the Collection Runner (optionally with a CSV data file).",
+      "item": [
+        {
+          "name": "01 - Resolve VM",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "const skip = () => { if (pm.execution && pm.execution.skipRequest) pm.execution.skipRequest(); };",
+                  "",
+                  "// Reset per-run state so values never leak between Runner iterations / CSV rows.",
+                  "['vmId', 'vmPowerState', 'datacenterId', 'targetNetworkId', 'nicId', 'nicState',",
+                  " 'originalBackingType', 'originalNetworkId', 'originalNetworkName', 'moveStatus']",
+                  "    .forEach(k => pm.environment.unset(k));",
+                  "",
+                  "const missing = ['vmName', 'targetPortGroup', 'targetBackingType'].filter(k => !v(k));",
+                  "if (missing.length) { abort('Missing required variable(s): ' + missing.join(', ')); skip(); return; }",
+                  "",
+                  "const types = ['STANDARD_PORTGROUP', 'DISTRIBUTED_PORTGROUP'];",
+                  "if (!types.includes(v('targetBackingType'))) {",
+                  "    abort('targetBackingType must be one of ' + types.join(' | ') + \" (got '\" + v('targetBackingType') + \"')\");",
+                  "    skip(); return;",
+                  "}",
+                  "const dry = String(v('dryRun')).toLowerCase() === 'true';",
+                  "console.log('=== ' + (dry ? '[DRY RUN] ' : '') + 'VM \"' + v('vmName') + '\" / \"' + (v('nicLabel') || 'only NIC') +",
+                  "            '\"  ->  ' + v('targetBackingType') + ' \"' + v('targetPortGroup') + '\"');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('VM lookup returned 200', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code !== 200) { abort('VM lookup failed (HTTP ' + pm.response.code + ')'); return; }",
+                  "",
+                  "const exact = pm.response.json().filter(x => x.name === v('vmName'));",
+                  "if (exact.length === 0) { abort('VM \"' + v('vmName') + '\" not found'); return; }",
+                  "if (exact.length > 1)  { abort('VM name \"' + v('vmName') + '\" is ambiguous: ' + exact.map(x => x.vm).join(', ')); return; }",
+                  "",
+                  "pm.test('Exactly one VM matched', () => pm.expect(exact.length).to.eql(1));",
+                  "pm.environment.set('vmId', exact[0].vm);",
+                  "pm.environment.set('vmPowerState', exact[0].power_state);",
+                  "console.log('VM resolved: ' + exact[0].vm + ' (' + exact[0].power_state + ')');",
+                  "",
+                  "if (!v('datacenterName')) next('03 - Resolve Target Network');   // datacenter scoping is optional"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm?names={{vmName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm"
+              ],
+              "query": [
+                {
+                  "key": "names",
+                  "value": "{{vmName}}"
+                }
+              ]
+            },
+            "description": "Validates inputs, resets per-run state and resolves `vmName` to a VM ID (e.g. `vm-1234`)."
+          }
+        },
+        {
+          "name": "02 - Resolve Datacenter",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('Datacenter lookup returned 200', () => pm.response.to.have.status(200));",
+                  "const dcs = pm.response.code === 200 ? pm.response.json().filter(d => d.name === v('datacenterName')) : [];",
+                  "if (dcs.length !== 1) { abort('Datacenter \"' + v('datacenterName') + '\" not found or ambiguous'); return; }",
+                  "pm.environment.set('datacenterId', dcs[0].datacenter);",
+                  "console.log('Datacenter resolved: ' + dcs[0].datacenter);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/datacenter?names={{datacenterName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "datacenter"
+              ],
+              "query": [
+                {
+                  "key": "names",
+                  "value": "{{datacenterName}}"
+                }
+              ]
+            },
+            "description": "Optional. Runs only when `datacenterName` is set; scopes the port group search to that datacenter."
+          }
+        },
+        {
+          "name": "03 - Resolve Target Network",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Only scope the search to a datacenter if one was resolved.",
+                  "if (!pm.environment.get('datacenterId')) pm.request.url.query.remove('datacenters');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('Network lookup returned 200', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code !== 200) { abort('Network lookup failed (HTTP ' + pm.response.code + ')'); return; }",
+                  "",
+                  "const nets = pm.response.json().filter(n => n.name === v('targetPortGroup') && n.type === v('targetBackingType'));",
+                  "if (nets.length === 0) {",
+                  "    abort(v('targetBackingType') + ' \"' + v('targetPortGroup') + '\" not found' +",
+                  "          (v('datacenterName') ? ' in datacenter \"' + v('datacenterName') + '\"' : ''));",
+                  "    return;",
+                  "}",
+                  "if (nets.length > 1) {",
+                  "    abort('Port group name \"' + v('targetPortGroup') + '\" matches ' + nets.length +",
+                  "          ' networks (' + nets.map(n => n.network).join(', ') + '). Set datacenterName to disambiguate.');",
+                  "    return;",
+                  "}",
+                  "pm.test('Exactly one target network matched', () => pm.expect(nets.length).to.eql(1));",
+                  "pm.environment.set('targetNetworkId', nets[0].network);",
+                  "console.log('Target network resolved: ' + nets[0].network + ' (' + nets[0].type + ')');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/network?names={{targetPortGroup}}&types={{targetBackingType}}&datacenters={{datacenterId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "network"
+              ],
+              "query": [
+                {
+                  "key": "names",
+                  "value": "{{targetPortGroup}}"
+                },
+                {
+                  "key": "types",
+                  "value": "{{targetBackingType}}"
+                },
+                {
+                  "key": "datacenters",
+                  "value": "{{datacenterId}}"
+                }
+              ]
+            },
+            "description": "Resolves `targetPortGroup` to a network ID (`network-xx` for a standard port group, `dvportgroup-xx` for a VDS port group). Fails if the name is missing or ambiguous."
+          }
+        },
+        {
+          "name": "04 - Resolve NIC",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('NIC list returned 200', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code !== 200) { abort('Could not list NICs (HTTP ' + pm.response.code + ')'); return; }",
+                  "",
+                  "const nics  = pm.response.json();",
+                  "const label = v('nicLabel');",
+                  "if (nics.length === 0) { abort('VM has no network adapters'); return; }",
+                  "",
+                  "// Single NIC and no label requested -> take it.",
+                  "if (!label && nics.length === 1) {",
+                  "    pm.environment.set('nicId', nics[0].nic);",
+                  "    console.log('Single NIC found: ' + nics[0].nic);",
+                  "    return;",
+                  "}",
+                  "",
+                  "// Otherwise read each NIC and match on its label (e.g. \"Network adapter 2\").",
+                  "const found = [];",
+                  "let pending = nics.length;",
+                  "nics.forEach(n => {",
+                  "    pm.sendRequest({",
+                  "        url: v('baseUrl') + '/api/vcenter/vm/' + pm.environment.get('vmId') + '/hardware/ethernet/' + n.nic,",
+                  "        method: 'GET',",
+                  "        header: [{ key: 'vmware-api-session-id', value: pm.environment.get('sessionId') }]",
+                  "    }, (err, res) => {",
+                  "        if (!err && res.code === 200) found.push({ nic: n.nic, label: res.json().label });",
+                  "        if (--pending > 0) return;",
+                  "",
+                  "        const available = found.map(f => '\"' + f.label + '\" (' + f.nic + ')').join(', ');",
+                  "        if (!label) { abort('VM has ' + nics.length + ' NICs - set nicLabel. Available: ' + available); return; }",
+                  "        const match = found.filter(f => f.label === label);",
+                  "        if (match.length !== 1) { abort('NIC \"' + label + '\" not found. Available: ' + available); return; }",
+                  "        pm.test('NIC \"' + label + '\" resolved', () => pm.expect(match.length).to.eql(1));",
+                  "        pm.environment.set('nicId', match[0].nic);",
+                  "        console.log('NIC resolved: \"' + label + '\" -> ' + match[0].nic);",
+                  "    });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet"
+              ]
+            },
+            "description": "Finds the adapter whose label equals `nicLabel` (e.g. `Network adapter 1`). If the VM has one NIC, `nicLabel` may be blank."
+          }
+        },
+        {
+          "name": "05 - Snapshot Current NIC",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('NIC details returned 200', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code !== 200) { abort('Could not read NIC (HTTP ' + pm.response.code + ')'); return; }",
+                  "",
+                  "const d = pm.response.json();",
+                  "const b = d.backing || {};",
+                  "",
+                  "// Snapshot for rollback (used by the \"Rollback\" folder).",
+                  "pm.environment.set('originalBackingType', b.type);",
+                  "pm.environment.set('originalNetworkId',   b.network);",
+                  "pm.environment.set('originalNetworkName', b.network_name || '');",
+                  "pm.environment.set('nicState', d.state);",
+                  "",
+                  "console.log('Current: \"' + d.label + '\" [' + d.mac_address + '] on ' + b.type + ' \"' + (b.network_name || b.network) +",
+                  "            '\" (' + b.network + '), state=' + d.state);",
+                  "console.log('ROLLBACK-DATA,' + [v('vmName'), d.label, b.type, b.network_name || '', b.network].join(','));",
+                  "",
+                  "if (!['STANDARD_PORTGROUP', 'DISTRIBUTED_PORTGROUP'].includes(b.type)) {",
+                  "    console.warn('Source backing is ' + b.type + '; rollback via this collection is not supported for that type.');",
+                  "}",
+                  "",
+                  "if (b.type === v('targetBackingType') && b.network === pm.environment.get('targetNetworkId')) {",
+                  "    pm.environment.set('moveStatus', 'UNCHANGED (already on target)');",
+                  "    console.log('NIC is already on the target network - nothing to change.');",
+                  "    next('07 - Verify NIC');",
+                  "    return;",
+                  "}",
+                  "if (String(v('dryRun')).toLowerCase() === 'true') {",
+                  "    pm.environment.set('moveStatus', 'DRY RUN (no change made)');",
+                  "    console.log('DRY RUN: would move \"' + d.label + '\" from \"' + (b.network_name || b.network) + '\" to \"' + v('targetPortGroup') +",
+                  "                '\" (' + pm.environment.get('targetNetworkId') + ')');",
+                  "    next('99 - Logout');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ]
+            },
+            "description": "Records the current backing for rollback, skips the change if the NIC is already on the target, and stops here when `dryRun=true`."
+          }
+        },
+        {
+          "name": "06 - Move NIC to Target Network",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('NIC reconfigured (204)', () => pm.response.to.have.status(204));",
+                  "if (pm.response.code !== 204) { abort('Reconfigure failed (HTTP ' + pm.response.code + ') - see console for vCenter message'); return; }",
+                  "pm.environment.set('moveStatus', 'MOVED');",
+                  "console.log('NIC moved to ' + v('targetPortGroup') + ' (' + pm.environment.get('targetNetworkId') + ')');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ]
+            },
+            "description": "Reconfigures the NIC backing. Works hot (VM powered on). For a VDS port group, the VM's host must be a member of that VDS; for a standard port group, the port group must exist on the VM's host.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"backing\": {\n    \"type\": \"{{targetBackingType}}\",\n    \"network\": \"{{targetNetworkId}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "07 - Verify NIC",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ---- helpers -------------------------------------------------------------",
+                  "const v = (k) => pm.variables.get(k);",
+                  "const next = (name) => (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest(name) : postman.setNextRequest(name);",
+                  "const abort = (msg) => {",
+                  "    console.error('ABORT: ' + msg);",
+                  "    pm.environment.set('moveStatus', 'FAILED: ' + msg);",
+                  "    pm.test('ABORT: ' + msg, () => { throw new Error(msg); });",
+                  "    next('99 - Logout');",
+                  "};",
+                  "",
+                  "pm.test('NIC details returned 200', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "const b = d.backing || {};",
+                  "",
+                  "pm.test('NIC backing type is ' + v('targetBackingType'), () => pm.expect(b.type).to.eql(v('targetBackingType')));",
+                  "pm.test('NIC is on target network ' + pm.environment.get('targetNetworkId'),",
+                  "        () => pm.expect(b.network).to.eql(pm.environment.get('targetNetworkId')));",
+                  "pm.environment.set('nicState', d.state);",
+                  "console.log('Verified: \"' + d.label + '\" on \"' + (b.network_name || b.network) + '\", state=' + d.state);",
+                  "",
+                  "const wantConnect = String(v('ensureConnected')).toLowerCase() !== 'false';",
+                  "if (d.state !== 'CONNECTED' && wantConnect && pm.environment.get('vmPowerState') === 'POWERED_ON') {",
+                  "    next('08 - Connect NIC');",
+                  "} else {",
+                  "    if (d.state !== 'CONNECTED') console.warn('NIC is ' + d.state + ' (VM ' + pm.environment.get('vmPowerState') + '); not connecting.');",
+                  "    next('99 - Logout');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ]
+            },
+            "description": "Re-reads the NIC and asserts it is on the target network. Branches to Connect if the NIC is disconnected on a powered-on VM."
+          }
+        },
+        {
+          "name": "08 - Connect NIC",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('NIC connected (204)', () => pm.response.to.have.status(204));",
+                  "if (pm.response.code === 204) console.log('NIC connected.');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}?action=connect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ],
+              "query": [
+                {
+                  "key": "action",
+                  "value": "connect"
+                }
+              ]
+            },
+            "description": "Connects the adapter (only reached when `ensureConnected` is not `false` and the VM is powered on)."
+          }
+        },
+        {
+          "name": "99 - Logout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Session closed', () => pm.expect(pm.response.code).to.be.oneOf([200, 204, 401]));",
+                  "pm.environment.unset('sessionId');",
+                  "pm.environment.unset('sessionLastUsed');",
+                  "const e = (k) => pm.environment.get(k) || '';",
+                  "console.log('RESULT,MOVE' + ',' + [pm.variables.get('vmName'), pm.variables.get('nicLabel') || e('nicId'),",
+                  "    e('originalNetworkName') || e('originalNetworkId'), pm.variables.get('targetPortGroup'), e('moveStatus')].join(','));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/session",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "session"
+              ]
+            },
+            "description": "Closes the vCenter session and prints a `RESULT,...` CSV line for audit."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Rollback",
+      "description": "Restores the NIC captured by the most recent single-VM Move run.",
+      "item": [
+        {
+          "name": "R1 - Rollback NIC to Original Network",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const skip = () => { if (pm.execution && pm.execution.skipRequest) pm.execution.skipRequest(); };",
+                  "",
+                  "const missing = ['vmId', 'nicId', 'originalBackingType', 'originalNetworkId'].filter(k => !pm.environment.get(k));",
+                  "const okType = ['STANDARD_PORTGROUP', 'DISTRIBUTED_PORTGROUP'].includes(pm.environment.get('originalBackingType'));",
+                  "if (missing.length || !okType) {",
+                  "    const msg = missing.length ? 'No rollback snapshot (missing ' + missing.join(', ') + '). Run the Move folder first.'",
+                  "                               : 'Original backing type ' + pm.environment.get('originalBackingType') + ' cannot be restored here.';",
+                  "    console.error(msg);",
+                  "    pm.test('Rollback prerequisites present', () => { throw new Error(msg); });",
+                  "    pm.environment.set('moveStatus', 'ROLLBACK FAILED: ' + msg);",
+                  "    (pm.execution && pm.execution.setNextRequest) ? pm.execution.setNextRequest('R9 - Logout') : postman.setNextRequest('R9 - Logout');",
+                  "    skip();",
+                  "    return;",
+                  "}",
+                  "console.log('Rolling back ' + pm.environment.get('vmId') + '/' + pm.environment.get('nicId') + ' -> ' +",
+                  "            pm.environment.get('originalBackingType') + ' \"' + pm.environment.get('originalNetworkName') + '\" (' +",
+                  "            pm.environment.get('originalNetworkId') + ')');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('NIC restored (204)', () => pm.response.to.have.status(204));",
+                  "pm.environment.set('moveStatus', pm.response.code === 204 ? 'ROLLED BACK' : 'ROLLBACK FAILED');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ]
+            },
+            "description": "Restores the backing captured by `05 - Snapshot Current NIC` in the last Move run (single VM).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"backing\": {\n    \"type\": \"{{originalBackingType}}\",\n    \"network\": \"{{originalNetworkId}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "R2 - Verify Rollback",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('NIC details returned 200', () => pm.response.to.have.status(200));",
+                  "const b = (pm.response.json() || {}).backing || {};",
+                  "pm.test('NIC is back on original network', () => pm.expect(b.network).to.eql(pm.environment.get('originalNetworkId')));",
+                  "console.log('NIC now on \"' + (b.network_name || b.network) + '\"');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet/{{nicId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet",
+                "{{nicId}}"
+              ]
+            },
+            "description": "Asserts the NIC is back on the original network."
+          }
+        },
+        {
+          "name": "R9 - Logout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Session closed', () => pm.expect(pm.response.code).to.be.oneOf([200, 204, 401]));",
+                  "pm.environment.unset('sessionId');",
+                  "pm.environment.unset('sessionLastUsed');",
+                  "const e = (k) => pm.environment.get(k) || '';",
+                  "console.log('RESULT,ROLLBACK' + ',' + [pm.variables.get('vmName'), pm.variables.get('nicLabel') || e('nicId'),",
+                  "    e('originalNetworkName') || e('originalNetworkId'), pm.variables.get('targetPortGroup'), e('moveStatus')].join(','));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/session",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "session"
+              ]
+            },
+            "description": "Closes the vCenter session."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Utilities",
+      "description": "Read-only discovery helpers.",
+      "item": [
+        {
+          "name": "U1 - List VMs",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.variables.get('vmName')) pm.request.url.query.remove('names');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.response.json().forEach(x => console.log([x.vm, x.name, x.power_state].join('  |  ')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm?names={{vmName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm"
+              ],
+              "query": [
+                {
+                  "key": "names",
+                  "value": "{{vmName}}"
+                }
+              ]
+            },
+            "description": "Lists VMs (filtered by `vmName` when set)."
+          }
+        },
+        {
+          "name": "U2 - List Port Groups (Standard + VDS)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.response.json()",
+                  "  .sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name))",
+                  "  .forEach(n => console.log([n.type.padEnd(22), n.network.padEnd(20), n.name].join('  ')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/network?types=STANDARD_PORTGROUP&types=DISTRIBUTED_PORTGROUP",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "network"
+              ],
+              "query": [
+                {
+                  "key": "types",
+                  "value": "STANDARD_PORTGROUP"
+                },
+                {
+                  "key": "types",
+                  "value": "DISTRIBUTED_PORTGROUP"
+                }
+              ]
+            },
+            "description": "Prints every standard and distributed port group with its ID. Use it to pick `targetPortGroup`."
+          }
+        },
+        {
+          "name": "U3 - List Datacenters",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.response.json().forEach(d => console.log(d.datacenter + '  |  ' + d.name));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/datacenter",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "datacenter"
+              ]
+            },
+            "description": "Lists datacenters."
+          }
+        },
+        {
+          "name": "U4 - Show VM NICs",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.environment.get('vmId')) throw new Error('vmId is empty - run \"01 - Resolve VM\" (or the Move folder with dryRun=true) first.');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const base = pm.variables.get('baseUrl') + '/api/vcenter/vm/' + pm.environment.get('vmId') + '/hardware/ethernet/';",
+                  "pm.response.json().forEach(n => pm.sendRequest({ url: base + n.nic, method: 'GET',",
+                  "    header: [{ key: 'vmware-api-session-id', value: pm.environment.get('sessionId') }] }, (e, r) => {",
+                  "    if (e || r.code !== 200) return console.error('NIC ' + n.nic + ': read failed');",
+                  "    const d = r.json(), b = d.backing || {};",
+                  "    console.log([n.nic, d.label, d.mac_address, b.type, b.network_name || '', b.network, d.state].join('  |  '));",
+                  "}));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/vcenter/vm/{{vmId}}/hardware/ethernet",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "vcenter",
+                "vm",
+                "{{vmId}}",
+                "hardware",
+                "ethernet"
+              ]
+            },
+            "description": "Prints label, MAC, backing and state of each NIC on `vmId`."
+          }
+        }
+      ]
+    }
+  ]
+}
